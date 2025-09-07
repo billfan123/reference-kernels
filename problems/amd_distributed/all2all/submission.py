@@ -1,3 +1,4 @@
+import sys
 import torch
 import torch.distributed as dist
 from task import input_t, output_t
@@ -28,14 +29,30 @@ class PyTorchAllToAll:
         token_map = [[] for _ in range(self.world_size)]
         # 1.3 token meta data, need update for combine
         meta_map = [[] for _ in range(self.world_size)]
-        for t, expert_list in enumerate(indices.tolist()):
-            for k, e in enumerate(expert_list):
-                dst_rank = e // self.num_local_experts
-                send_counts[dst_rank] += 1
-                token_map[dst_rank].append(t)
-                meta_map[dst_rank].extend(
-                    [e, self.rank, t, k, 0]
-                )  # srcGobalExpert, srcRank, srcIndex, expert index
+        num_tokens, top_k = indices.shape
+        indices_flat = indices.flatten()  # (num_tokens * top_k,)
+        t_idx = torch.arange(num_tokens, device=device).repeat_interleave(top_k)  # (num_tokens * top_k,)
+        k_idx = torch.arange(top_k, device=device).repeat(num_tokens)  # (num_tokens * top_k,)
+
+        dst_rank = torch.div(indices_flat, self.num_local_experts, rounding_mode='floor')  # (num_tokens * top_k,)
+        # 统计每个rank要发送的token数
+        send_counts = torch.bincount(dst_rank, minlength=self.world_size).tolist()
+
+        # token_map: 每个rank对应的token下标
+        token_mask = [dst_rank == r for r in range(self.world_size)]
+        token_map = [t_idx[mask] for mask in token_mask]
+
+        # meta_map: 每个rank对应的meta信息
+        meta_map = [
+            torch.stack([
+                indices_flat[mask],  # global expert id
+                torch.full((mask.sum(),), self.rank, dtype=torch.long, device=device),  # src rank
+                t_idx[mask],  # src token
+                k_idx[mask],  # src k
+                torch.zeros(mask.sum(), dtype=torch.long, device=device)  # pad
+            ], dim=1)
+            for mask in token_mask
+        ]
 
         send_counts_t = torch.tensor(send_counts, dtype=torch.long, device=device)
         # 1.3 token nums to recv from each rank
