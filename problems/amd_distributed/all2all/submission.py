@@ -128,24 +128,34 @@ class PyTorchAllToAll:
         device = out_tokens.device
         cfg = self.cfg
 
-        # 1. count send-back tokens in cur rank
-        send_counts = [0] * self.world_size
-        # 1.1 token that will send back
-        y_map = [[] for _ in range(self.world_size)]
-        # 1.2 meta info of each token that send back to its src rank
-        meta_map = [[] for _ in range(self.world_size)]
+        # 1. Flatten expert_num_tokens to get valid tokens' mask
+        local_eids = torch.arange(self.num_local_experts, device=device)
+        counts = expert_num_tokens.cpu().numpy()
+        total_tokens = int(counts.sum())
+        # Build a mask for valid tokens
+        mask = torch.zeros((self.num_local_experts, self.max_recv), dtype=torch.bool, device=device)
+        for eid in range(self.num_local_experts):
+            mask[eid, :counts[eid]] = True
 
-        # 2. traverse each token of each local expert of each rank, fill into send_counts and y_map and meta_map
-        for local_eid in range(self.num_local_experts):
-            cnt = int(expert_num_tokens[local_eid].item())
-            for j in range(cnt):
-                # meta info token j of local eid
-                meta = expert_meta[local_eid, j]
-                dst_rank = int(meta[1].item())
-                send_counts[dst_rank] += 1
-                # token j and its meta that send back to dst rank/local eid
-                y_map[dst_rank].append(expert_y[local_eid, j].unsqueeze(0))
-                meta_map[dst_rank].extend(meta.tolist())
+        # 2. Get all valid meta and y in a single operation
+        valid_indices = mask.nonzero(as_tuple=False)
+        valid_meta = expert_meta[valid_indices[:, 0], valid_indices[:, 1]]  # (N, META_DIM)
+        valid_y = expert_y[valid_indices[:, 0], valid_indices[:, 1]]        # (N, hidden_dim)
+
+        # 3. Get dst_rank for each token
+        dst_ranks = valid_meta[:, 1].to(torch.long)  # (N,)
+
+        # 4. Count send-back tokens per rank
+        send_counts = torch.bincount(dst_ranks, minlength=self.world_size).tolist()
+
+        # 5. Split valid_y and valid_meta by dst_rank
+        y_map = [[] for _ in range(self.world_size)]
+        meta_map = [[] for _ in range(self.world_size)]
+        for r in range(self.world_size):
+            idx = (dst_ranks == r).nonzero(as_tuple=False).squeeze(-1)
+            if idx.numel() > 0:
+                y_map[r].append(valid_y[idx])
+                meta_map[r].extend(valid_meta[idx].tolist())
         # token nums that cur rank plan to send to other ranks
         send_counts_t = torch.tensor(send_counts, dtype=torch.long, device=device)
         # token nums that will recv from other ranks
