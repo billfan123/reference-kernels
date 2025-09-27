@@ -1,5 +1,6 @@
 import sys
 import torch
+import time
 import torch.distributed as dist
 from task import input_t, output_t
 
@@ -29,6 +30,7 @@ class PyTorchAllToAll:
         token_map = [[] for _ in range(self.world_size)]
         # 1.3 token meta data, need update for combine
         meta_map = [[] for _ in range(self.world_size)]
+        print(time.perf_counter(), file=sys.stderr)
         num_tokens, top_k = indices.shape
         indices_flat = indices.flatten()  # (num_tokens * top_k,)
         t_idx = torch.arange(num_tokens, device=device).repeat_interleave(top_k)  # (num_tokens * top_k,)
@@ -53,11 +55,14 @@ class PyTorchAllToAll:
             ], dim=1)
             for mask in token_mask
         ]
+        # print(meta_map, file=sys.stderr)
 
         send_counts_t = torch.tensor(send_counts, dtype=torch.long, device=device)
         # 1.3 token nums to recv from each rank
         recv_counts_t = torch.empty(self.world_size, dtype=torch.long, device=device)
         dist.all_to_all_single(recv_counts_t, send_counts_t)
+        dist.barrier()
+        print(time.perf_counter(), file=sys.stderr)
         # ---------2. send and recv buffer, order by tokens on each rank ----------
         send_buf = torch.cat([dp_x[idx_list] for idx_list in token_map], dim=0)
         total_recv = int(recv_counts_t.sum().item())
@@ -65,9 +70,10 @@ class PyTorchAllToAll:
             total_recv, cfg.hidden_dim, dtype=cfg.in_dtype, device=device
         )
 
+        # print([e for sub in meta_map for v in sub for e in v], file=sys.stderr)
         # 2.1 meta buf for send and recv
         send_meta = torch.tensor(
-            [v for sub in meta_map for v in sub], dtype=torch.int32, device=device
+            [e for sub in meta_map for v in sub for e in v], dtype=torch.int32, device=device
         ).view(-1, self.META_DIM)
         recv_meta = torch.empty(
             total_recv, self.META_DIM, dtype=torch.int32, device=device
