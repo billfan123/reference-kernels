@@ -417,11 +417,32 @@ def custom_kernel(data: input_t) -> output_t:
     M, local_K = input.shape
     N = weight.shape[0]
     world_size = torch.distributed.get_world_size()
-    # matmul
-    output = torch.matmul(input, weight.T)
+    rank = torch.distributed.get_rank()
+    # 获取进程组（假设tp_group已定义，或使用默认进程组）
+    try:
+        # 尝试获取已存在的张量并行进程组
+        tp_group = torch.distributed.distributed_c10d._get_default_group()
+    except:
+        # 如果没有预定义的进程组，使用默认的全局进程组
+        tp_group = None
+    context = create_gemm_rs_intra_node_context(M, N, input.dtype, rank, world_size, tp_group)
+
+    # 调用gemm_rs_intra_node_op执行矩阵乘法和归约散射
+    output = gemm_rs_intra_node_op(
+        a=input, 
+        b=weight, 
+        output_dtype=input.dtype, 
+        rank=rank, 
+        num_ranks=world_size, 
+        scatter_bufs=context.scatter_bufs, 
+        scatter_bufs_ptr=context.scatter_bufs_ptr, 
+        sync_bufs_ptr=context.sync_bufs_ptr,
+        fuse_scatter=True, 
+        transpose_weight=False
+    )
+    
+    # 应用bias（如果有）
     if bias is not None:
         output = output + bias
-    # reduce scatter
-    rs_output = torch.empty((M // world_size, N), dtype=output.dtype, device=input.device)
-    torch.distributed.reduce_scatter_tensor(rs_output, output)
-    return rs_output
+
+    return output
